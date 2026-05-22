@@ -46,6 +46,7 @@ env:
 
   # === LLM 配置 ===
   LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+  LLM_FALLBACK_API_KEY: ${{ secrets.LLM_FALLBACK_API_KEY }}
 
 jobs:
   prepare:
