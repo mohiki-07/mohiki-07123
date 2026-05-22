@@ -821,7 +821,8 @@ class Reflector:
             return "高危"
         elif vt_lower in medium_types:
             return "中危"
-        return "高危"  # 默认高危
+        # 未知类型默认 INFO，避免信息收集类发现被误判为高危
+        return "信息"
 
     def _infer_vuln_type_from_text(self, description: str, node_id: str = "") -> str:
         """从描述文本中推断漏洞类型。优先级: description > node_id"""
@@ -1284,12 +1285,16 @@ class Reflector:
                 "metrics": None,
             }
 
+    # 触发推送和停止的最低严重程度阈值
+    _MIN_SEVERITY_RANK = {"信息": 0, "低危": 1, "中危": 2, "高危": 3, "严重": 4}
+    _MIN_SEVERITY_FOR_NOTIFICATION = "中危"  # 只有中危及以上才推送和停止
+
     async def _notify_dingtalk_from_graph(self, graph_manager: GraphManager) -> None:
         """
         从因果图中提取已确认漏洞，推送钉钉通知并创建停止信号。
 
-        在 reflect() 子任务反思 和 reflect_global() 全局反思 中都会调用，
-        确保无论漏洞在哪个阶段被确认，都能触发推送和停止。
+        严重程度阈值: 只有 中危 及以上才会触发推送和停止。
+        在 reflect() 子任务反思 和 reflect_global() 全局反思 中都会调用。
         """
         try:
             from core.dingtalk_notifier import DingTalkNotifier
@@ -1302,7 +1307,6 @@ class Reflector:
                 return
 
             # 从因果图中提取所有 ConfirmedVulnerability 节点
-            import networkx as nx
             confirmed_vulns = []
             if graph_manager and hasattr(graph_manager, 'causal_graph'):
                 for node_id, data in graph_manager.causal_graph.nodes(data=True):
@@ -1315,22 +1319,38 @@ class Reflector:
             if not confirmed_vulns:
                 return
 
+            # 过滤：只处理 severity >= 中危 的漏洞
+            min_rank = self._MIN_SEVERITY_RANK.get(self._MIN_SEVERITY_FOR_NOTIFICATION, 2)
+            notify_vulns = []
+            for vuln_node in confirmed_vulns:
+                vuln_info = self._extract_vulnerability_info(vuln_node, "")
+                severity_rank = self._MIN_SEVERITY_RANK.get(vuln_info.get("severity", "信息"), 0)
+                if severity_rank >= min_rank:
+                    notify_vulns.append((vuln_node, vuln_info))
+
+            if not notify_vulns:
+                _get_console().print(
+                    f"[DingTalk] 发现 {len(confirmed_vulns)} 个漏洞，"
+                    f"但严重程度均低于 {self._MIN_SEVERITY_FOR_NOTIFICATION}，不触发推送",
+                    style="yellow"
+                )
+                return
+
             notifier = DingTalkNotifier(
                 webhook_url=DINGTALK_WEBHOOK,
                 secret=DINGTALK_SECRET
             )
 
-            for vuln_node in confirmed_vulns:
-                # 避免重复推送（已推送过的标记为 _dingtalk_notified）
+            for vuln_node, vuln_info in notify_vulns:
+                # 避免重复推送
                 if vuln_node.get("_dingtalk_notified"):
                     continue
-
-                vuln_info = self._extract_vulnerability_info(vuln_node, "")
 
                 success = await notifier.send_vulnerability_alert(vuln_info)
                 if success:
                     _get_console().print(
-                        f"[DingTalk] 漏洞推送成功: {vuln_info.get('title', 'Unknown')}",
+                        f"[DingTalk] 漏洞推送成功 [{vuln_info.get('severity', '?')}]: "
+                        f"{vuln_info.get('title', 'Unknown')}",
                         style="bold green"
                     )
                     # 标记已推送
@@ -1343,7 +1363,7 @@ class Reflector:
                         style="bold red"
                     )
 
-                # 创建停止信号
+                # 创建停止信号（仅中危及以上）
                 if DINGTALK_STOP_ON_VULN and graph_manager and hasattr(graph_manager, 'task_id'):
                     import os, json, tempfile
                     halt_file = os.path.join(tempfile.gettempdir(), f"{graph_manager.task_id}.halt")
@@ -1355,7 +1375,8 @@ class Reflector:
                     with open(halt_file, "w", encoding="utf-8") as f:
                         json.dump(halt_payload, f, ensure_ascii=False)
                     _get_console().print(
-                        f"[DingTalk] 已发现有效漏洞，测试任务已自动停止: {vuln_info.get('title', '')}",
+                        f"[DingTalk] 已发现 {vuln_info.get('severity', '?')} 级别漏洞，"
+                        f"测试任务已自动停止: {vuln_info.get('title', '')}",
                         style="bold yellow"
                     )
 
